@@ -1,0 +1,15 @@
+# Data folders
+input/
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -78,6 +78,24 @@ def load_data(paths: Paths) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return invoices, bank
 
 
+def invoice_vendor_key(row: pd.Series) -> Optional[str]:
+    """Extract a 'vendor key' from Vendor/Credit Acc. field only."""
+    vend = str(row.get("Vendor/Credit Acc.", "")).strip()
+    if not vend or vend.lower() == "nan":
+        return None
+
+    if "(" in vend:
+        name = vend.split("(", 1)[0].strip()
+    else:
+        name = vend
+
+    parts = name.split()
+    for p in parts:
+        if len(p) >= 3:
+            return p
+    return parts[0] if parts else None
+
+
 def preprocess_invoices(invoices: pd.DataFrame) -> pd.DataFrame:
     invoices = invoices.copy()
     invoices["Amount_clean"] = pd.to_numeric(
@@ -88,8 +106,10 @@ def preprocess_invoices(invoices: pd.DataFrame) -> pd.DataFrame:
     )
     invoices["inv_date"] = invoices["Transaction Date"].apply(parse_date)
     invoices["supplier_key"] = invoices.apply(invoice_supplier_key, axis=1)
+    invoices["vendor_key"] = invoices.apply(invoice_vendor_key, axis=1)
     invoices["matched"] = False
     invoices["match_type"] = None
+    invoices["match_confidence"] = None  # high, medium, low
     invoices["bank_rows"] = None
     return invoices
 
@@ -117,31 +137,56 @@ def preprocess_bank(bank: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def pass_single_amount_match(invoices: pd.DataFrame, bank_match: pd.DataFrame) -> None:
-    """Pass 1: invoice -> single bank row by amount, filtered by supplier_key."""
+    """Pass 1: invoice -> single bank row by amount, filtered by supplier_key.
+
+    Confidence levels:
+    - high: supplier_key matches bank description
+    - medium: vendor_key matches bank description (fallback)
+
+    No amount-only matching - supplier name is required.
+    """
     for inv_idx, inv in invoices[invoices["Amount_clean"].notna()].iterrows():
         if inv["matched"]:
             continue
         amount = inv["Amount_clean"]
-        key = inv["supplier_key"]
-        cand = bank_match[~bank_match["matched"]]
-        if key:
-            cand = cand[cand["Unnamed: 2"].astype(str).str.contains(key, na=False)]
-        if cand.empty:
-            continue
-        exact = cand[(cand["mag"] - amount).abs() <= TOL]
-        if exact.empty:
-            continue
+        supplier_key = inv["supplier_key"]
+        vendor_key = inv["vendor_key"]
 
-        exact = exact.copy()
-        if inv["inv_date"] is not None:
-            exact["date_diff"] = (exact["date"] - inv["inv_date"]).abs().dt.days
-            exact = exact.sort_values(["date_diff", "date"])
-        row = exact.index[0]
+        all_cand = bank_match[~bank_match["matched"]]
 
-        bank_match.at[row, "matched"] = True
-        invoices.at[inv_idx, "matched"] = True
-        invoices.at[inv_idx, "match_type"] = "single"
-        invoices.at[inv_idx, "bank_rows"] = [int(row)]
+        # Try supplier_key first (high confidence)
+        matched_row = None
+        confidence = None
+
+        if supplier_key:
+            cand = all_cand[all_cand["Unnamed: 2"].astype(str).str.contains(supplier_key, na=False)]
+            exact = cand[(cand["mag"] - amount).abs() <= TOL]
+            if not exact.empty:
+                exact = exact.copy()
+                if inv["inv_date"] is not None:
+                    exact["date_diff"] = (exact["date"] - inv["inv_date"]).abs().dt.days
+                    exact = exact.sort_values(["date_diff", "date"])
+                matched_row = exact.index[0]
+                confidence = "high"
+
+        # Try vendor_key if supplier_key didn't match (medium confidence)
+        if matched_row is None and vendor_key and vendor_key != supplier_key:
+            cand = all_cand[all_cand["Unnamed: 2"].astype(str).str.contains(vendor_key, na=False)]
+            exact = cand[(cand["mag"] - amount).abs() <= TOL]
+            if not exact.empty:
+                exact = exact.copy()
+                if inv["inv_date"] is not None:
+                    exact["date_diff"] = (exact["date"] - inv["inv_date"]).abs().dt.days
+                    exact = exact.sort_values(["date_diff", "date"])
+                matched_row = exact.index[0]
+                confidence = "medium"
+
+        if matched_row is not None:
+            bank_match.at[matched_row, "matched"] = True
+            invoices.at[inv_idx, "matched"] = True
+            invoices.at[inv_idx, "match_type"] = "single"
+            invoices.at[inv_idx, "match_confidence"] = confidence
+            invoices.at[inv_idx, "bank_rows"] = [int(matched_row)]
 
 
 def pass_combo_two_bank(invoices: pd.DataFrame, bank_match: pd.DataFrame) -> None:
@@ -228,6 +273,7 @@ def build_invoice_bank_matches(invoices: pd.DataFrame, bank_match: pd.DataFrame)
                 {
                     "Invoice_Index": inv_idx,
                     "Match_Type": inv["match_type"],
+                    "Confidence": inv.get("match_confidence", "high"),
                     "Invoice_Date": inv.get("Transaction Date"),
                     "Invoice_Details": inv.get("Details"),
                     "Invoice_Vendor": inv.get("Vendor/Credit Acc."),
@@ -333,6 +379,145 @@ class ConfigPaths:
     out_dir: Path
 
 
+def generate_html(df: pd.DataFrame, title: str, output_path: Path, color_by_confidence: bool = False) -> None:
+    """Generate an HTML file with a styled table from a DataFrame."""
+    html_template = """<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }}
+        h1 {{
+            color: #333;
+            border-bottom: 2px solid #4CAF50;
+            padding-bottom: 10px;
+        }}
+        .stats {{
+            background-color: #e8f5e9;
+            padding: 10px 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            display: inline-block;
+        }}
+        .legend {{
+            margin-bottom: 20px;
+            padding: 10px;
+            background-color: white;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }}
+        .legend-item {{
+            display: inline-block;
+            margin-left: 20px;
+            padding: 5px 10px;
+            border-radius: 3px;
+        }}
+        .legend-high {{ background-color: #c8e6c9; }}
+        .legend-medium {{ background-color: #fff9c4; }}
+        .legend-low {{ background-color: #ffcdd2; }}
+        table {{
+            border-collapse: collapse;
+            width: 100%;
+            background-color: white;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }}
+        th {{
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px 8px;
+            text-align: right;
+            position: sticky;
+            top: 0;
+        }}
+        td {{
+            padding: 10px 8px;
+            border-bottom: 1px solid #ddd;
+            text-align: right;
+        }}
+        tr:hover {{
+            filter: brightness(0.95);
+        }}
+        tr.confidence-high {{
+            background-color: #c8e6c9;
+        }}
+        tr.confidence-medium {{
+            background-color: #fff9c4;
+        }}
+        tr.confidence-low {{
+            background-color: #ffcdd2;
+        }}
+        .amount {{
+            font-family: monospace;
+            direction: ltr;
+            text-align: left;
+        }}
+        .negative {{
+            color: #c62828;
+        }}
+        .positive {{
+            color: #2e7d32;
+        }}
+    </style>
+</head>
+<body>
+    <h1>{title}</h1>
+    <div class="stats">Total rows: {row_count}</div>
+    {legend}
+    {table}
+</body>
+</html>"""
+
+    legend_html = ""
+    if color_by_confidence and not df.empty and "Confidence" in df.columns:
+        legend_html = """
+    <div class="legend">
+        <strong>Confidence:</strong>
+        <span class="legend-item legend-high">High - Supplier match</span>
+        <span class="legend-item legend-medium">Medium - Vendor match</span>
+        <span class="legend-item legend-low">Low - Amount only</span>
+    </div>"""
+
+    if df.empty:
+        table_html = "<p>No data</p>"
+    else:
+        if color_by_confidence and "Confidence" in df.columns:
+            # Build HTML table manually with row classes
+            table_html = '<table class="data-table">\n<thead>\n<tr>'
+            for col in df.columns:
+                table_html += f"<th>{col}</th>"
+            table_html += "</tr>\n</thead>\n<tbody>\n"
+            for _, row in df.iterrows():
+                conf = row.get("Confidence", "high")
+                if conf is None:
+                    conf = "high"
+                table_html += f'<tr class="confidence-{conf}">'
+                for col in df.columns:
+                    val = row[col]
+                    if pd.isna(val):
+                        val = ""
+                    table_html += f"<td>{val}</td>"
+                table_html += "</tr>\n"
+            table_html += "</tbody>\n</table>"
+        else:
+            table_html = df.to_html(index=False, classes="data-table", escape=False)
+
+    html_content = html_template.format(
+        title=title,
+        row_count=len(df),
+        legend=legend_html,
+        table=table_html,
+    )
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+
 def run(paths: ConfigPaths) -> None:
     invoices_raw, bank_raw = load_data(Paths(paths.invoices, paths.bank, paths.out_dir))
     invoices = preprocess_invoices(invoices_raw)
@@ -349,14 +534,39 @@ def run(paths: ConfigPaths) -> None:
     out_dir = paths.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Write CSV files
     invoice_bank_matches.to_csv(out_dir / "final_invoice_bank_matches.csv", index=False)
     cheque_best.to_csv(out_dir / "final_cheque_best_matches.csv", index=False)
     unmatched_clean.to_csv(out_dir / "unmatched_clean_final.csv", index=False)
+
+    # Generate HTML files
+    generate_html(
+        invoice_bank_matches,
+        "Invoice-Bank Matches",
+        out_dir / "final_invoice_bank_matches.html",
+        color_by_confidence=True,
+    )
+    generate_html(
+        cheque_best,
+        "Cheque Best Matches",
+        out_dir / "final_cheque_best_matches.html",
+    )
+    # Select cleaner columns for unmatched display
+    unmatched_display = unmatched_clean[["N/A", "Unnamed: 2", "amount"]].copy()
+    unmatched_display.columns = ["Date", "Description", "Amount"]
+    generate_html(
+        unmatched_display,
+        "Unmatched Bank Debits",
+        out_dir / "unmatched_clean_final.html",
+    )
 
     print("Wrote:")
     print(f"  - {out_dir / 'final_invoice_bank_matches.csv'}")
     print(f"  - {out_dir / 'final_cheque_best_matches.csv'}")
     print(f"  - {out_dir / 'unmatched_clean_final.csv'}")
+    print(f"  - {out_dir / 'final_invoice_bank_matches.html'}")
+    print(f"  - {out_dir / 'final_cheque_best_matches.html'}")
+    print(f"  - {out_dir / 'unmatched_clean_final.html'}")
 
 
 def parse_args() -> ConfigPaths:
