@@ -1,6 +1,7 @@
 # Data folders
 input/
 output/
+state/
 
 # Python
 __pycache__/
